@@ -24,6 +24,7 @@
 #define SERIAL_SEND_HEADER            1
 #define ADC_SAMPLES_COUNT             1000
 #define MAX_PACKET_SIZE               20
+#define ZERO_VOLT_VALUE               1650
 
 #define SENS_TENSAO1                  ADC1_CHANNEL_0
 #define SENS_TENSAO2                  ADC1_CHANNEL_3

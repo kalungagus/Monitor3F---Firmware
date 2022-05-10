@@ -56,6 +56,7 @@ void sendCmdString(unsigned char cmd, String s)
   Serial.write(header, 5);
   #endif
   Serial.write(s.c_str());
+  Serial.flush();
   xSemaphoreGive(serialSem);
 }
 
@@ -128,6 +129,7 @@ void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length)
   Serial.write(header, 5);
   #endif
   Serial.write((const unsigned char *)buff, length);
+  Serial.flush();
   xSemaphoreGive(serialSem);
 }
 
@@ -141,6 +143,7 @@ void sendAck(unsigned char cmd)
 
   xSemaphoreTake(serialSem, portMAX_DELAY);
   Serial.write(txBuffer, 4);
+  Serial.flush();
   xSemaphoreGive(serialSem);
 }
 
