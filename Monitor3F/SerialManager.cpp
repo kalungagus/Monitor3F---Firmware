@@ -4,6 +4,11 @@
 #include "SystemDefinitions.h"
 
 //==================================================================================================
+// Macros
+//==================================================================================================
+#define DEBUG()           digitalWrite(DEBUG_PIN, !digitalRead(DEBUG_PIN))
+
+//==================================================================================================
 // Funções do módulo, declaradas aqui para melhor organização do arquivo
 //==================================================================================================
 void initSerialManager(void);
@@ -13,6 +18,7 @@ void sendCmdBuff(unsigned char, char *, unsigned int);
 void sendCmdString(unsigned char, String);
 static void sendAck(unsigned char);
 static void taskSerialReceive(void *);
+static void taskSerialSend(void *);
 static void loadIntoArray(uint32_t, char *);
 
 // Esta função deve ser declarada em um arquivo de projeto para tratar os comandos recebidos por este
@@ -23,6 +29,8 @@ extern void processReception(char *packet, unsigned int packetSize);
 // Variáveis do módulo
 //==================================================================================================
 SemaphoreHandle_t serialSem;
+QueueHandle_t messageQueue;
+QueueHandle_t samplesQueue;
 char rxPacket[MAX_PACKET_SIZE];
 
 //==================================================================================================
@@ -32,7 +40,10 @@ void initSerialManager(void)
 {
   Serial.begin(115200);
   serialSem = xSemaphoreCreateMutex();
-  xTaskCreate(taskSerialReceive, "SerialEvent", 2000, NULL, 1, NULL);
+  messageQueue = xQueueCreate(MESSAGE_QUEUE_SIZE, MAX_PACKET_SIZE);
+  samplesQueue = xQueueCreate(SAMPLE_QUEUE_SIZE, sizeof(analogSample));
+  xTaskCreate(taskSerialReceive, "SerialEvent", 2000, NULL, 2, NULL);
+  xTaskCreate(taskSerialSend, "SerialSend", 2000, NULL, 2, NULL);
 }
 
 void sendMessage(String s)
@@ -48,22 +59,68 @@ void sendMessageWithNewLine(String s)
 
 void sendCmdString(unsigned char cmd, String s)
 {
-  unsigned int packetSize = s.length() + 1;
-  unsigned char header[5] = {0xAA, 0x55, ((char*)(&packetSize))[0], ((char*)(&packetSize))[1] , cmd};
+  unsigned char txBuffer[MAX_PACKET_SIZE];
+  const char *charArray = s.c_str();
+  unsigned int length = s.length();
 
-  xSemaphoreTake(serialSem, portMAX_DELAY);
+  length = (length+4 > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE - 4 : length;
+  txBuffer[0] = 0xAA;
+  txBuffer[1] = 0x55;
+  txBuffer[2] = length + 1;
+  txBuffer[3] = cmd;
+
+  for(int i=0; i<length; i++)
+    txBuffer[4+i] = charArray[i];
+
+  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+}
+
+void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length)
+{
+  unsigned char txBuffer[MAX_PACKET_SIZE];
+
+  length = (length+4 > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE - 4 : length;
+  txBuffer[0] = 0xAA;
+  txBuffer[1] = 0x55;
+  txBuffer[2] = length + 1;
+  txBuffer[3] = cmd;
+
+  for(int i=0; i<length; i++)
+    txBuffer[4+i] = buff[i];
+  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+}
+
+void sendAck(unsigned char cmd)
+{
   #if (SERIAL_SEND_HEADER == 1)
-  Serial.write(header, 5);
+  unsigned char txBuffer[4] = {0xAA, 0x55, 0x01, 0x06};
+  #else
+  unsigned char txBuffer[4] = {'O', 'K', '\r', '\n'};
   #endif
-  Serial.write(s.c_str());
-  Serial.flush();
-  xSemaphoreGive(serialSem);
+ 
+  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+}
+
+bool sendSample(analogSample *theSample)
+{
+  return(xQueueSend(samplesQueue, (void *)theSample, (TickType_t)0) == pdTRUE);
+}
+
+bool clearSamples(void)
+{
+  return(xQueueReset(samplesQueue) == pdTRUE);
+}
+
+static void loadIntoArray(uint32_t value, char *buffer)
+{
+  for(int i=0; i<sizeof(uint32_t); i++)
+    buffer[i] = ((char *)(&value))[i];
 }
 
 static void taskSerialReceive(void *pvParameters)
 {
   char CharSerialRX;
-  unsigned int messageSize=0;
+  unsigned char messageSize=0;
   int serialState = 0;
   int size=0;
 
@@ -72,7 +129,7 @@ static void taskSerialReceive(void *pvParameters)
     if(Serial.available())
     {
       CharSerialRX = (char)Serial.read();
-      
+
       switch(serialState)
       {
         case 0:
@@ -84,14 +141,9 @@ static void taskSerialReceive(void *pvParameters)
             serialState++;
           break;
         case 2:
-          ((char*)(&messageSize))[0] = CharSerialRX;
-          serialState++;
-          break;
-        case 3:
-          ((char*)(&messageSize))[1] = CharSerialRX;
-          serialState++;
-          messageSize = (messageSize > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : messageSize;
+          messageSize = (CharSerialRX > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : CharSerialRX;
           size=0;
+          serialState++;
           break;
         default:
           if(size < messageSize)
@@ -110,47 +162,38 @@ static void taskSerialReceive(void *pvParameters)
     }
     else
     {
-      vTaskDelay( 20 / portTICK_PERIOD_MS );
+      vTaskDelay( 10 / portTICK_PERIOD_MS );
     }
   }
 }
 
-void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length)
+static void taskSerialSend(void *pvParameters)
 {
-  unsigned char header[5] = {0xAA, 0x55, 0x00, 0x00, cmd};
-  unsigned int packetSize = length + 1;
+  analogSample sampleToSend;
+  char txPacket[MAX_PACKET_SIZE];
+  const unsigned char sampleHeader[4] = {0xAA, 0x55, sizeof(analogSample)+1, CMD_SAMPLE_SEND};
   
-  // Insere o tamanho no buffer
-  header[2] = ((char*)(&packetSize))[0];
-  header[3] = ((char*)(&packetSize))[1];
-  
-  xSemaphoreTake(serialSem, portMAX_DELAY);
-  #if (SERIAL_SEND_HEADER == 1)
-  Serial.write(header, 5);
-  #endif
-  Serial.write((const unsigned char *)buff, length);
-  Serial.flush();
-  xSemaphoreGive(serialSem);
-}
-
-void sendAck(unsigned char cmd)
-{
-  #if (SERIAL_SEND_HEADER == 1)
-  unsigned char txBuffer[6] = {0xAA, 0x55, 0x01, 0x00, 0x06};
-  #else
-  unsigned char txBuffer[4] = {'O', 'K', '\r', '\n'};
-  #endif
-
-  xSemaphoreTake(serialSem, portMAX_DELAY);
-  Serial.write(txBuffer, 4);
-  Serial.flush();
-  xSemaphoreGive(serialSem);
-}
-
-static void loadIntoArray(uint32_t value, char *buffer)
-{
-  for(int i=0; i<sizeof(uint32_t); i++)
-    buffer[i] = ((char *)(&value))[i];
+  for(;;)
+  {
+    if(xQueueReceive(samplesQueue, &sampleToSend, (TickType_t)0) == pdPASS)
+    {
+      #if (SERIAL_SEND_HEADER == 1)
+      Serial.write(sampleHeader, 4);
+      Serial.flush();
+      #endif
+      Serial.write((char *)(&sampleToSend), sizeof(analogSample));
+      Serial.flush();
+    }
+    else if(xQueueReceive(messageQueue, &txPacket, (TickType_t)0) == pdPASS)
+    {
+      int length = txPacket[2] + 3;
+      
+      Serial.write(txPacket, length);
+      Serial.flush();
+    }
+    else
+      vTaskDelay( 10 / portTICK_PERIOD_MS );
+  }
 }
 
 //==================================================================================================

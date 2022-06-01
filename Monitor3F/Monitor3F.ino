@@ -10,13 +10,17 @@
 #include <soc/sens_struct.h>
 
 //==================================================================================================
+// Macros
+//==================================================================================================
+#define DEBUG()           digitalWrite(DEBUG_PIN, !digitalRead(DEBUG_PIN))
+
+//==================================================================================================
 // Variáveis globais do sistema
 //==================================================================================================
 portMUX_TYPE DRAM_ATTR timerMux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t * adcTimer = NULL;
 
 TaskHandle_t signalSamplingTask;
-uint16_t signalSamples[6];
 bool samplingEnabled = false;
 bool waitSignalStart = true;
 uint16_t signal1Pos = 0;
@@ -24,19 +28,6 @@ uint16_t signal1Pos = 0;
 //==================================================================================================
 // Funções do sistema
 //==================================================================================================
-int IRAM_ATTR local_adc1_read(int channel) 
-{
-    uint16_t adc_value;
-
-    SENS.sar_meas_start1.sar1_en_pad = (1 << channel);
-    while (SENS.sar_slave_addr1.meas_status != 0);
-    SENS.sar_meas_start1.meas1_start_sar = 0;
-    SENS.sar_meas_start1.meas1_start_sar = 1;
-    while (SENS.sar_meas_start1.meas1_done_sar == 0);
-    adc_value = SENS.sar_meas_start1.meas1_data_sar;
-    return adc_value;
-}
-
 void setupSampling(void)
 {
   signal1Pos = 0;
@@ -57,7 +48,7 @@ uint16_t readADC_Cal(int ADC_Raw)
 //==================================================================================================
 // Interrupção de timer: 1s
 void IRAM_ATTR onTimer() 
-{
+{  
   portENTER_CRITICAL_ISR(&timerMux);
 
   // Mesmo que o timer fique ativo, ele não irá amostrar nada sem que o
@@ -79,6 +70,7 @@ void IRAM_ATTR onTimer()
 void signalSampling(void *param) 
 {
   uint16_t sensorValue;
+  analogSample signalSamples;
   
   for(;;) 
   {
@@ -94,13 +86,13 @@ void signalSampling(void *param)
           sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
         
         // Envia as primeiras amostras do sinal
-        signalSamples[0] = sensorValue;
-        signalSamples[1] = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
-        signalSamples[2] = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
-        signalSamples[3] = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
-        signalSamples[4] = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
-        signalSamples[5] = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
-        sendCmdBuff(CMD_SAMPLE_SEND, (char *)(&signalSamples[0]), sizeof(signalSamples));
+        signalSamples.T1 = sensorValue;
+        signalSamples.T2 = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
+        signalSamples.T3 = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
+        signalSamples.I1 = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
+        signalSamples.I2 = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
+        signalSamples.I3 = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
+        sendSample(&signalSamples);
   
         // Inicia a amostragem do sinal
         waitSignalStart = false;
@@ -110,16 +102,18 @@ void signalSampling(void *param)
       {
         // Aguarda um pacote de amostras
         ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        signalSamples[0] = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
-        signalSamples[1] = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
-        signalSamples[2] = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
-        signalSamples[3] = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
-        signalSamples[4] = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
-        signalSamples[5] = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
-        sendCmdBuff(CMD_SAMPLE_SEND, (char *)(&signalSamples[0]), sizeof(signalSamples));
-    
+        digitalWrite(DEBUG_PIN, HIGH);
+        signalSamples.T1 = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
+        signalSamples.T2 = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
+        signalSamples.T3 = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
+        signalSamples.I1 = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
+        signalSamples.I2 = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
+        signalSamples.I3 = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
+        sendSample(&signalSamples);
+        digitalWrite(DEBUG_PIN, LOW);
+            
         signal1Pos++;
-        if(signal1Pos > 50)
+        if(signal1Pos > 3000)
         {
           signal1Pos = 0;
           samplingEnabled = false;
@@ -128,7 +122,8 @@ void signalSampling(void *param)
     }
     else
     {
-      // Se não estiver amostrando sinal, desliga o timer e suspende a task. 
+      // Se não estiver amostrando sinal, desliga o timer e suspende a task.
+      sendCmdString(CMD_MESSAGE, "Parando amostragem\r\n");
       timerAlarmDisable(adcTimer);
       vTaskSuspend(NULL);
     }
@@ -141,7 +136,7 @@ void signalSampling(void *param)
 void processReception(char *packet, unsigned int packetSize)
 {
   int sensorPin = A0;
-  uint16_t sensorValue = 0;
+  uint16_t sensorValue[2] = {0 , 0};
   
   switch(packet[0])
   {
@@ -151,19 +146,20 @@ void processReception(char *packet, unsigned int packetSize)
       ESP.restart();
       break;
     case CMD_SET_SAMPLING_STATE:
-      samplingEnabled = packet[1];
-      if(packet[1] == 1)
+      if(samplingEnabled == false && packet[1] == 1)
       {
         sendCmdString(CMD_MESSAGE, "Amostrando\r\n");
         waitSignalStart = true;
         samplingEnabled = true;
         vTaskResume(signalSamplingTask);
       }
-      else
+      else if(samplingEnabled == true && packet[1] == 0)
       {
-        sendCmdString(CMD_MESSAGE, "Parando amostragem\r\n");
-        waitSignalStart = false;
-        samplingEnabled = false;
+        if(clearSamples())
+        {
+          waitSignalStart = false;
+          samplingEnabled = false;
+        }
       }
       break;
     case CMD_GET_ADC_READING:
@@ -171,30 +167,36 @@ void processReception(char *packet, unsigned int packetSize)
       {
         case 0:
           sendCmdString(CMD_MESSAGE, "Lendo tensao 1.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
+          sensorValue[0] = adc1_get_raw(SENS_TENSAO1);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 1:
           sendCmdString(CMD_MESSAGE, "Lendo tensao 2.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
+          sensorValue[0] = adc1_get_raw(SENS_TENSAO2);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 2:
           sendCmdString(CMD_MESSAGE, "Lendo tensao 3.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
+          sensorValue[0] = adc1_get_raw(SENS_TENSAO3);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 3:
           sendCmdString(CMD_MESSAGE, "Lendo corrente 1.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
+          sensorValue[0] = adc1_get_raw(SENS_CORRENTE1);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 4:
           sendCmdString(CMD_MESSAGE, "Lendo corrente 2.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
+          sensorValue[0] = adc1_get_raw(SENS_CORRENTE2);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 5:
           sendCmdString(CMD_MESSAGE, "Lendo corrente 3.\r\n");
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
+          sensorValue[0] = adc1_get_raw(SENS_CORRENTE3);
+          sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
       }      
-      sendCmdBuff(CMD_GET_ADC_READING, (char *)(&sensorValue), sizeof(sensorValue));
+      sendCmdBuff(CMD_GET_ADC_READING, (char *)sensorValue, sizeof(sensorValue));
       break;
     case CMD_SEND_ECHO:
       sendCmdBuff(CMD_MESSAGE, &packet[1], packetSize-1);
@@ -215,6 +217,8 @@ void setup()
     // Inicialização dos pinos dos sensores
     sendMessageWithNewLine("Inicializando sistema...");
 
+    pinMode(DEBUG_PIN, OUTPUT);
+    
     adc1_config_width(ADC_WIDTH_12Bit);
     adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
     adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_DB_11);
@@ -224,13 +228,13 @@ void setup()
     adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11);
 
     // Criação da Task para gerenciar a amostragem de sinais
-    xTaskCreate(signalSampling, "Sampler Task", 8192, NULL, 1, &signalSamplingTask);
+    xTaskCreate(signalSampling, "Sampler Task", 8192, NULL, tskIDLE_PRIORITY, &signalSamplingTask);
     vTaskSuspend(signalSamplingTask);
     
     // Definição de timer para rotinas de tempo
     adcTimer = timerBegin(0, 80, true);                  // Timer trabalhando a 80MHz / 80 == 1MHZ
     timerAttachInterrupt(adcTimer, &onTimer, true);      // Liga a interrupção à função definida
-    timerAlarmWrite(adcTimer, 1000, true);               // Amostragem em aproximadamente 300Hz
+    timerAlarmWrite(adcTimer, 1000, true);               // Amostragem em aproximadamente 1000Hz
     //timerAlarmEnable(adcTimer);
     
     sendMessageWithNewLine("Inicializacao completa.");
