@@ -3,6 +3,7 @@
 //==================================================================================================
 #include "SystemDefinitions.h"
 #include "SerialManager.h"
+#include "WiFiManager.h"
 #include "esp_system.h"
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
@@ -21,16 +22,17 @@ portMUX_TYPE DRAM_ATTR timerMux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t * adcTimer = NULL;
 
 TaskHandle_t signalSamplingTask;
+QueueHandle_t samplesQueue;
 bool samplingEnabled = false;
-bool waitSignalStart = true;
-uint16_t signal1Pos = 0;
+uint16_t signalPos = 0;
+uint16_t quantSamples = 1000;
 
 //==================================================================================================
 // Funções do sistema
 //==================================================================================================
 void setupSampling(void)
 {
-  signal1Pos = 0;
+  signalPos = 0;
   timerWrite(adcTimer, 0);
   timerAlarmEnable(adcTimer);
 }
@@ -46,6 +48,20 @@ uint16_t readADC_Cal(int ADC_Raw)
 //==================================================================================================
 // Interrupções
 //==================================================================================================
+void IRAM_ATTR onButton() 
+{
+  if(samplingEnabled == false)
+  {
+    BaseType_t xYieldRequired;
+    
+    quantSamples = 1000;
+    samplingEnabled = true;
+    setupSampling();
+    xYieldRequired = xTaskResumeFromISR(signalSamplingTask);
+    portYIELD_FROM_ISR(xYieldRequired);
+  }
+}
+
 // Interrupção de timer: 1s
 void IRAM_ATTR onTimer() 
 {  
@@ -76,54 +92,29 @@ void signalSampling(void *param)
   {
     if(samplingEnabled)
     {
-      if(waitSignalStart)
+      // Aguarda um pacote de amostras
+      ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+      //digitalWrite(DEBUG_PIN, HIGH);
+      signalSamples.T1 = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
+      signalSamples.T2 = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
+      signalSamples.T3 = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
+      signalSamples.I1 = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
+      signalSamples.I2 = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
+      signalSamples.I3 = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
+      sendSample(&signalSamples);
+      //digitalWrite(DEBUG_PIN, LOW);
+          
+      signalPos++;
+      if(signalPos > quantSamples)
       {
-        // Espera semi-ciclo negativo
-        while(readADC_Cal(adc1_get_raw(SENS_TENSAO1)) > ZERO_VOLT_VALUE);
-        sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
-        // Espera semi-ciclo positivo para começar
-        while(sensorValue < ZERO_VOLT_VALUE)
-          sensorValue = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
-        
-        // Envia as primeiras amostras do sinal
-        signalSamples.T1 = sensorValue;
-        signalSamples.T2 = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
-        signalSamples.T3 = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
-        signalSamples.I1 = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
-        signalSamples.I2 = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
-        signalSamples.I3 = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
-        sendSample(&signalSamples);
-  
-        // Inicia a amostragem do sinal
-        waitSignalStart = false;
-        setupSampling();
-      }
-      else
-      {
-        // Aguarda um pacote de amostras
-        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-        digitalWrite(DEBUG_PIN, HIGH);
-        signalSamples.T1 = readADC_Cal(adc1_get_raw(SENS_TENSAO1));
-        signalSamples.T2 = readADC_Cal(adc1_get_raw(SENS_TENSAO2));
-        signalSamples.T3 = readADC_Cal(adc1_get_raw(SENS_TENSAO3));
-        signalSamples.I1 = readADC_Cal(adc1_get_raw(SENS_CORRENTE1));
-        signalSamples.I2 = readADC_Cal(adc1_get_raw(SENS_CORRENTE2));
-        signalSamples.I3 = readADC_Cal(adc1_get_raw(SENS_CORRENTE3));
-        sendSample(&signalSamples);
-        digitalWrite(DEBUG_PIN, LOW);
-            
-        signal1Pos++;
-        if(signal1Pos > 3000)
-        {
-          signal1Pos = 0;
-          samplingEnabled = false;
-        }
+        signalPos = 0;
+        samplingEnabled = false;
       }
     }
     else
     {
       // Se não estiver amostrando sinal, desliga o timer e suspende a task.
-      sendCmdString(CMD_MESSAGE, "Parando amostragem\r\n");
+      sendCmdString(CMD_MESSAGE, "Parando amostragem\r\n", DIRECT_TO_SERIAL);
       timerAlarmDisable(adcTimer);
       vTaskSuspend(NULL);
     }
@@ -137,71 +128,137 @@ void processReception(char *packet, unsigned int packetSize)
 {
   int sensorPin = A0;
   uint16_t sensorValue[2] = {0 , 0};
+  char s[5];
+  char tmpbuff[20];
+  unsigned int messageSize = packetSize-1;
+  int index;
   
   switch(packet[0])
   {
     case CMD_RESET:
-      sendCmdString(CMD_MESSAGE, "Reiniciando\r\n");
+      sendCmdString(CMD_MESSAGE, "Reiniciando\r\n", DIRECT_TO_SERIAL);
       delay(1000);
       ESP.restart();
       break;
     case CMD_SET_SAMPLING_STATE:
       if(samplingEnabled == false && packet[1] == 1)
       {
-        sendCmdString(CMD_MESSAGE, "Amostrando\r\n");
-        waitSignalStart = true;
+        quantSamples = *((uint16_t *)(&packet[2]));
+        snprintf(s, 5, "%d", quantSamples);
+        sendMessage("Lendo ", DIRECT_TO_SERIAL);
+        sendMessage(s, DIRECT_TO_SERIAL);
+        sendMessageWithNewLine(" amostras.", DIRECT_TO_SERIAL);
         samplingEnabled = true;
+        setupSampling();
         vTaskResume(signalSamplingTask);
       }
       else if(samplingEnabled == true && packet[1] == 0)
       {
-        if(clearSamples())
-        {
-          waitSignalStart = false;
-          samplingEnabled = false;
-        }
+        samplingEnabled = false;
+        clearSamples();
       }
       break;
     case CMD_GET_ADC_READING:
       switch(packet[1])
       {
         case 0:
-          sendCmdString(CMD_MESSAGE, "Lendo tensao 1.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo tensao 1.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_TENSAO1);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 1:
-          sendCmdString(CMD_MESSAGE, "Lendo tensao 2.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo tensao 2.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_TENSAO2);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 2:
-          sendCmdString(CMD_MESSAGE, "Lendo tensao 3.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo tensao 3.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_TENSAO3);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 3:
-          sendCmdString(CMD_MESSAGE, "Lendo corrente 1.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo corrente 1.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_CORRENTE1);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 4:
-          sendCmdString(CMD_MESSAGE, "Lendo corrente 2.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo corrente 2.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_CORRENTE2);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
         case 5:
-          sendCmdString(CMD_MESSAGE, "Lendo corrente 3.\r\n");
+          sendCmdString(CMD_MESSAGE, "Lendo corrente 3.\r\n", DIRECT_TO_SERIAL);
           sensorValue[0] = adc1_get_raw(SENS_CORRENTE3);
           sensorValue[1] = readADC_Cal(sensorValue[0]);
           break;
       }      
-      sendCmdBuff(CMD_GET_ADC_READING, (char *)sensorValue, sizeof(sensorValue));
+      sendCmdBuff(CMD_GET_ADC_READING, (char *)sensorValue, sizeof(sensorValue), PRIORITY_SELECT);
       break;
     case CMD_SEND_ECHO:
-      sendCmdBuff(CMD_MESSAGE, &packet[1], packetSize-1);
+      sendCmdBuff(CMD_MESSAGE, &packet[1], messageSize, PRIORITY_SELECT);
+      break;
+    case CMD_SEND_SSID:
+      if(messageSize > SSID_LENGHT) messageSize = SSID_LENGHT;
+      for(index=0; index<messageSize; index++)
+        tmpbuff[index] = packet[index+1];
+      for(; index<SSID_LENGHT; index++)
+        tmpbuff[index] = 0;
+      tmpbuff[messageSize] = 0;
+      saveWiFiSSID(tmpbuff);
+      sendCmdString(CMD_MESSAGE, "SSID Alterado.\r\n", DIRECT_TO_SERIAL);
+      break;
+    case CMD_GET_SSID:
+      loadWiFiSSID(tmpbuff);
+      sendCmdString(CMD_GET_SSID, tmpbuff, PRIORITY_SELECT);
+      break;
+    case CMD_SEND_PASSWORD:
+      if(messageSize > SSID_LENGHT) messageSize = PASSWORD_LENGTH;
+      for(index=0; index<messageSize; index++)
+        tmpbuff[index] = packet[index+1];
+      for(; index<PASSWORD_LENGTH; index++)
+        tmpbuff[index] = 0;
+      tmpbuff[messageSize] = 0;
+      saveWiFiPassword(tmpbuff);
+      sendCmdString(CMD_MESSAGE, "Password Alterado.\r\n", DIRECT_TO_SERIAL);
+      break;
+    case CMD_GET_PASSWORD:
+      loadWiFiPassword(tmpbuff);
+      sendCmdString(CMD_GET_PASSWORD, tmpbuff, PRIORITY_SELECT);
       break;
     default:
+      break;
+  }
+}
+
+void processCharReception(unsigned char data, serialBuffer *thisSerial)
+{
+  switch(thisSerial->state)
+  {
+    case 0:
+      if(data == 0xAA) 
+        thisSerial->state++;
+      break;
+    case 1:
+      if(data == 0x55) 
+        thisSerial->state++;
+      break;
+    case 2:
+      thisSerial->messageSize = (data > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : data;
+      thisSerial->bytesReaded=0;
+      thisSerial->state++;
+      break;
+    default:
+      if(thisSerial->bytesReaded < thisSerial->messageSize)
+      {
+        thisSerial->packet[thisSerial->bytesReaded++] = data;
+        if(thisSerial->bytesReaded >= thisSerial->messageSize)
+        {
+          processReception(thisSerial->packet, thisSerial->messageSize);
+          thisSerial->state = 0;
+        }
+      }
+      else
+        thisSerial->state = 0;
       break;
   }
 }
@@ -211,11 +268,12 @@ void processReception(char *packet, unsigned int packetSize)
 //==================================================================================================
 void setup() 
 {
+    samplesQueue = xQueueCreate(SAMPLE_QUEUE_SIZE, sizeof(analogSample));
     initSerialManager();
     delay(1000);
     
     // Inicialização dos pinos dos sensores
-    sendMessageWithNewLine("Inicializando sistema...");
+    sendMessageWithNewLine("Inicializando sistema...", PRIORITY_SELECT);
 
     pinMode(DEBUG_PIN, OUTPUT);
     
@@ -235,9 +293,13 @@ void setup()
     adcTimer = timerBegin(0, 80, true);                  // Timer trabalhando a 80MHz / 80 == 1MHZ
     timerAttachInterrupt(adcTimer, &onTimer, true);      // Liga a interrupção à função definida
     timerAlarmWrite(adcTimer, 1000, true);               // Amostragem em aproximadamente 1000Hz
-    //timerAlarmEnable(adcTimer);
+
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButton, FALLING);
+
+    initWiFiManager();
     
-    sendMessageWithNewLine("Inicializacao completa.");
+    sendMessageWithNewLine("Inicializacao completa.", PRIORITY_SELECT);
 }
 
 //==================================================================================================

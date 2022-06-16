@@ -2,6 +2,8 @@
 // Includes
 //==================================================================================================
 #include "SystemDefinitions.h"
+#include "WiFiManager.h"
+#include "System.h"
 
 //==================================================================================================
 // Macros
@@ -9,14 +11,20 @@
 #define DEBUG()           digitalWrite(DEBUG_PIN, !digitalRead(DEBUG_PIN))
 
 //==================================================================================================
+// QUEUE SELECT
+//==================================================================================================
+#define PRIORITY_SELECT            0
+#define DIRECT_TO_SERIAL           1
+
+//==================================================================================================
 // Funções do módulo, declaradas aqui para melhor organização do arquivo
 //==================================================================================================
 void initSerialManager(void);
-void sendMessage(String);
-void sendMessageWithNewLine(String);
-void sendCmdBuff(unsigned char, char *, unsigned int);
-void sendCmdString(unsigned char, String);
-static void sendAck(unsigned char);
+void sendMessage(String, unsigned int);
+void sendMessageWithNewLine(String, unsigned int);
+void sendCmdBuff(unsigned char, char *, unsigned int, unsigned int);
+void sendCmdString(unsigned char, String, unsigned int);
+void sendAck(unsigned char, unsigned int);
 static void taskSerialReceive(void *);
 static void taskSerialSend(void *);
 static void loadIntoArray(uint32_t, char *);
@@ -30,7 +38,7 @@ extern void processReception(char *packet, unsigned int packetSize);
 //==================================================================================================
 SemaphoreHandle_t serialSem;
 QueueHandle_t messageQueue;
-QueueHandle_t samplesQueue;
+QueueHandle_t directSerialQueue;
 char rxPacket[MAX_PACKET_SIZE];
 
 //==================================================================================================
@@ -41,23 +49,23 @@ void initSerialManager(void)
   Serial.begin(115200);
   serialSem = xSemaphoreCreateMutex();
   messageQueue = xQueueCreate(MESSAGE_QUEUE_SIZE, MAX_PACKET_SIZE);
-  samplesQueue = xQueueCreate(SAMPLE_QUEUE_SIZE, sizeof(analogSample));
+  directSerialQueue = xQueueCreate(MESSAGE_QUEUE_SIZE, MAX_PACKET_SIZE);
   xTaskCreate(taskSerialReceive, "SerialEvent", 2000, NULL, 2, NULL);
   xTaskCreate(taskSerialSend, "SerialSend", 2000, NULL, 2, NULL);
 }
 
-void sendMessage(String s)
+void sendMessage(String s, unsigned int isDirect)
 {
-  sendCmdString(CMD_MESSAGE, s);
+  sendCmdString(CMD_MESSAGE, s, isDirect);
 }
 
-void sendMessageWithNewLine(String s)
+void sendMessageWithNewLine(String s, unsigned int isDirect)
 {
   String msg = s + "\r\n";
-  sendCmdString(CMD_MESSAGE, msg);
+  sendCmdString(CMD_MESSAGE, msg, isDirect);
 }
 
-void sendCmdString(unsigned char cmd, String s)
+void sendCmdString(unsigned char cmd, String s, unsigned int isDirect)
 {
   unsigned char txBuffer[MAX_PACKET_SIZE];
   const char *charArray = s.c_str();
@@ -72,10 +80,13 @@ void sendCmdString(unsigned char cmd, String s)
   for(int i=0; i<length; i++)
     txBuffer[4+i] = charArray[i];
 
-  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+  if(isDirect == PRIORITY_SELECT)
+    xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+  else
+    xQueueSend(directSerialQueue, (void *)txBuffer, (TickType_t)0);
 }
 
-void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length)
+void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length, unsigned int isDirect)
 {
   unsigned char txBuffer[MAX_PACKET_SIZE];
 
@@ -87,18 +98,25 @@ void sendCmdBuff(unsigned char cmd, char *buff, unsigned int length)
 
   for(int i=0; i<length; i++)
     txBuffer[4+i] = buff[i];
-  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+
+  if(isDirect == PRIORITY_SELECT)
+    xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+  else
+    xQueueSend(directSerialQueue, (void *)txBuffer, (TickType_t)0);
 }
 
-void sendAck(unsigned char cmd)
+void sendAck(unsigned char cmd, unsigned int isDirect)
 {
   #if (SERIAL_SEND_HEADER == 1)
   unsigned char txBuffer[4] = {0xAA, 0x55, 0x01, 0x06};
   #else
   unsigned char txBuffer[4] = {'O', 'K', '\r', '\n'};
   #endif
- 
-  xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+
+  if(isDirect == PRIORITY_SELECT)
+    xQueueSend(messageQueue, (void *)txBuffer, (TickType_t)0);
+  else
+    xQueueSend(directSerialQueue, (void *)txBuffer, (TickType_t)0);
 }
 
 bool sendSample(analogSample *theSample)
@@ -172,26 +190,44 @@ static void taskSerialSend(void *pvParameters)
   analogSample sampleToSend;
   char txPacket[MAX_PACKET_SIZE];
   const unsigned char sampleHeader[4] = {0xAA, 0x55, sizeof(analogSample)+1, CMD_SAMPLE_SEND};
+  bool waitPackets;
   
   for(;;)
   {
-    if(xQueueReceive(samplesQueue, &sampleToSend, (TickType_t)0) == pdPASS)
+    waitPackets = true;
+    
+    if(isClientConnected() == false)
     {
-      #if (SERIAL_SEND_HEADER == 1)
-      Serial.write(sampleHeader, 4);
-      Serial.flush();
-      #endif
-      Serial.write((char *)(&sampleToSend), sizeof(analogSample));
-      Serial.flush();
+      if(xQueueReceive(samplesQueue, &sampleToSend, (TickType_t)0) == pdPASS)
+      {
+        #if (SERIAL_SEND_HEADER == 1)
+        Serial.write(sampleHeader, 4);
+        Serial.flush();
+        #endif
+        Serial.write((char *)(&sampleToSend), sizeof(analogSample));
+        Serial.flush();
+        waitPackets = false;
+      }
+      if(xQueueReceive(messageQueue, &txPacket, (TickType_t)0) == pdPASS)
+      {
+        int length = txPacket[2] + 3;
+        
+        Serial.write(txPacket, length);
+        Serial.flush();
+        waitPackets = false;
+      }
     }
-    else if(xQueueReceive(messageQueue, &txPacket, (TickType_t)0) == pdPASS)
+    
+    if(xQueueReceive(directSerialQueue, &txPacket, (TickType_t)0) == pdPASS)
     {
       int length = txPacket[2] + 3;
       
       Serial.write(txPacket, length);
       Serial.flush();
+      waitPackets = false;
     }
-    else
+
+    if(waitPackets)
       vTaskDelay( 10 / portTICK_PERIOD_MS );
   }
 }
