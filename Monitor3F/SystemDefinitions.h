@@ -21,6 +21,7 @@
 #define CMD_GET_SSID             0x87
 #define CMD_SEND_PASSWORD        0x88
 #define CMD_GET_PASSWORD         0x89
+#define CMD_SET_BUTTON_SAMPLES   0x90
 
 //==================================================================================================
 // Configurações
@@ -51,7 +52,9 @@
 #define SSID_LENGHT                  20
 #define PASSWORD_ADDRESS             SSID_ADDRESS+SSID_LENGHT
 #define PASSWORD_LENGTH              20
-#define EEPROM_SIZE                  PASSWORD_ADDRESS+PASSWORD_LENGTH
+#define BUTTON_SAMPLES_ADDRESS       PASSWORD_ADDRESS+PASSWORD_LENGTH
+#define BUTTON_SAMPLES_LENGHT        2
+#define EEPROM_SIZE                  BUTTON_SAMPLES_ADDRESS+BUTTON_SAMPLES_LENGHT
 
 //--------------------------------------------------------------------------------------------------
 // Credenciais de rede

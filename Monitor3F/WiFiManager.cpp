@@ -2,7 +2,6 @@
 // Includes
 //==================================================================================================
 #include <WiFi.h>
-#include <EEPROM.h>
 #include <NetBIOS.h>
 #include <AsyncUDP.h>
 #include "SystemDefinitions.h"
@@ -23,8 +22,6 @@ void loadWiFiSSID(char *);
 void saveWiFiSSID(char *);
 void loadWiFiPassword(char *);
 void saveWiFiPassword(char *);
-static void saveDataEEPROM(char *, int, int);
-static void getDataEEPROM(char *, int, int);
 void taskCheckWiFiStatus(void *);
 bool isWiFiConnected(void);
 void resetWiFiConnection(void);
@@ -37,8 +34,6 @@ void udpProcessing(void *pvParameters);
 //==================================================================================================
 // Variáveis do módulo
 //==================================================================================================
-SemaphoreHandle_t internalEEPROMSem;
-
 xTaskHandle taskOnline;
 xTaskHandle taskOffline;
 xTaskHandle taskUdp;
@@ -58,11 +53,7 @@ serialBuffer wifiReceivedData;
 void initWiFiManager(void)
 {
   sendMessageWithNewLine("Inicializando gerenciador de WiFi.", DIRECT_TO_SERIAL);
-  
-  internalEEPROMSem = xSemaphoreCreateMutex();
   memset(&wifiReceivedData, 0, sizeof(wifiReceivedData));
-
-  EEPROM.begin(EEPROM_SIZE);
 
   xTaskCreate(taskCheckWiFiStatus, "CheckWiFiStatus", 2000, NULL, 1, &taskOffline);
   xTaskCreate(transmissionScheduler, "TransmissionScheduler", 8192, NULL, 1, &taskOnline);
@@ -90,31 +81,6 @@ void loadWiFiPassword(char *buffer)
 void saveWiFiPassword(char *buffer)
 {
   saveDataEEPROM(buffer, PASSWORD_ADDRESS, PASSWORD_LENGTH);
-}
-
-static void saveDataEEPROM(char *data, int address, int length)
-{
-  int i;
-  
-  xSemaphoreTake(internalEEPROMSem, portMAX_DELAY);
-  for(i=0; i<length; i++)
-  {
-    EEPROM.put(address+i, data[i]);
-  }
-  EEPROM.commit();
-  xSemaphoreGive(internalEEPROMSem);
-}
-
-static void getDataEEPROM(char *data, int address, int length)
-{
-  int i;
-
-  xSemaphoreTake(internalEEPROMSem, portMAX_DELAY);
-  for(i=0; i<length; i++)
-  {
-    data[i] = EEPROM.read(address+i);
-  }
-  xSemaphoreGive(internalEEPROMSem);
 }
 
 bool isWiFiConnected(void)

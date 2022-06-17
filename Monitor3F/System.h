@@ -6,6 +6,9 @@
 // Funções
 //==================================================================================================
 extern void processCharReception(unsigned char data, serialBuffer *thisSerial);
+extern void saveDataEEPROM(char *data, int address, int length);
+extern void getDataEEPROM(char *data, int address, int length);
+
 //==================================================================================================
 // Variáveis globais do sistema
 //==================================================================================================

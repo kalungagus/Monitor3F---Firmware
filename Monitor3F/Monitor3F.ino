@@ -1,6 +1,7 @@
 //==================================================================================================
 // Includes
 //==================================================================================================
+#include <EEPROM.h>
 #include "SystemDefinitions.h"
 #include "SerialManager.h"
 #include "WiFiManager.h"
@@ -23,9 +24,12 @@ hw_timer_t * adcTimer = NULL;
 
 TaskHandle_t signalSamplingTask;
 QueueHandle_t samplesQueue;
+SemaphoreHandle_t internalEEPROMSem;
+
 bool samplingEnabled = false;
 uint16_t signalPos = 0;
 uint16_t quantSamples = 1000;
+uint16_t buttonSamples = 500;
 
 //==================================================================================================
 // Funções do sistema
@@ -54,7 +58,7 @@ void IRAM_ATTR onButton()
   {
     BaseType_t xYieldRequired;
     
-    quantSamples = 1000;
+    quantSamples = buttonSamples;
     samplingEnabled = true;
     setupSampling();
     xYieldRequired = xTaskResumeFromISR(signalSamplingTask);
@@ -119,6 +123,34 @@ void signalSampling(void *param)
       vTaskSuspend(NULL);
     }
   }
+}
+
+//==================================================================================================
+// EEPROM
+//==================================================================================================
+void saveDataEEPROM(char *data, int address, int length)
+{
+  int i;
+  
+  xSemaphoreTake(internalEEPROMSem, portMAX_DELAY);
+  for(i=0; i<length; i++)
+  {
+    EEPROM.put(address+i, data[i]);
+  }
+  EEPROM.commit();
+  xSemaphoreGive(internalEEPROMSem);
+}
+
+void getDataEEPROM(char *data, int address, int length)
+{
+  int i;
+
+  xSemaphoreTake(internalEEPROMSem, portMAX_DELAY);
+  for(i=0; i<length; i++)
+  {
+    data[i] = EEPROM.read(address+i);
+  }
+  xSemaphoreGive(internalEEPROMSem);
 }
 
 //==================================================================================================
@@ -225,6 +257,14 @@ void processReception(char *packet, unsigned int packetSize)
       loadWiFiPassword(tmpbuff);
       sendCmdString(CMD_GET_PASSWORD, tmpbuff, PRIORITY_SELECT);
       break;
+    case CMD_SET_BUTTON_SAMPLES:
+        buttonSamples = *((uint16_t *)(&packet[1]));
+        snprintf(s, 5, "%d", buttonSamples);
+        sendMessage("Botao capturara ", DIRECT_TO_SERIAL);
+        sendMessage(s, DIRECT_TO_SERIAL);
+        sendMessageWithNewLine(" amostras.", DIRECT_TO_SERIAL);
+        saveDataEEPROM((char *)&buttonSamples, BUTTON_SAMPLES_ADDRESS, sizeof(buttonSamples));
+      break;
     default:
       break;
   }
@@ -268,13 +308,13 @@ void processCharReception(unsigned char data, serialBuffer *thisSerial)
 //==================================================================================================
 void setup() 
 {
+    char s[5];
     samplesQueue = xQueueCreate(SAMPLE_QUEUE_SIZE, sizeof(analogSample));
     initSerialManager();
     delay(1000);
     
     // Inicialização dos pinos dos sensores
     sendMessageWithNewLine("Inicializando sistema...", PRIORITY_SELECT);
-
     pinMode(DEBUG_PIN, OUTPUT);
     
     adc1_config_width(ADC_WIDTH_12Bit);
@@ -294,6 +334,19 @@ void setup()
     timerAttachInterrupt(adcTimer, &onTimer, true);      // Liga a interrupção à função definida
     timerAlarmWrite(adcTimer, 1000, true);               // Amostragem em aproximadamente 1000Hz
 
+    // Inicialização do botão
+    internalEEPROMSem = xSemaphoreCreateMutex();
+    EEPROM.begin(EEPROM_SIZE);
+    getDataEEPROM((char *)&buttonSamples, BUTTON_SAMPLES_ADDRESS, sizeof(buttonSamples));
+    snprintf(s, 5, "%d", buttonSamples);
+    sendMessage("Botao capturara ", DIRECT_TO_SERIAL);
+    sendMessage(s, DIRECT_TO_SERIAL);
+    sendMessageWithNewLine(" amostras.", DIRECT_TO_SERIAL);   
+    if((buttonSamples < 500) || (buttonSamples > 10000))
+    {
+      buttonSamples = 500;
+      saveDataEEPROM((char *)&buttonSamples, BUTTON_SAMPLES_ADDRESS, sizeof(buttonSamples));
+    }
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButton, FALLING);
 
