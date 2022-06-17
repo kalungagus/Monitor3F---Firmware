@@ -39,13 +39,15 @@ extern void processReception(char *packet, unsigned int packetSize);
 SemaphoreHandle_t serialSem;
 QueueHandle_t messageQueue;
 QueueHandle_t directSerialQueue;
-char rxPacket[MAX_PACKET_SIZE];
+serialBuffer usbReceivedData;
 
 //==================================================================================================
 // Funções
 //==================================================================================================
 void initSerialManager(void)
 {
+  memset(&usbReceivedData, 0, sizeof(usbReceivedData));
+  
   Serial.begin(115200);
   serialSem = xSemaphoreCreateMutex();
   messageQueue = xQueueCreate(MESSAGE_QUEUE_SIZE, MAX_PACKET_SIZE);
@@ -147,36 +149,7 @@ static void taskSerialReceive(void *pvParameters)
     if(Serial.available())
     {
       CharSerialRX = (char)Serial.read();
-
-      switch(serialState)
-      {
-        case 0:
-          if(CharSerialRX == 0xAA) 
-            serialState++;
-          break;
-        case 1:
-          if(CharSerialRX == 0x55) 
-            serialState++;
-          break;
-        case 2:
-          messageSize = (CharSerialRX > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : CharSerialRX;
-          size=0;
-          serialState++;
-          break;
-        default:
-          if(size < messageSize)
-          {
-            rxPacket[size++] = CharSerialRX;
-            if(size >= messageSize)
-            {
-              processReception(rxPacket, size);
-              serialState = 0;
-            }
-          }
-          else
-            serialState = 0;
-          break;
-      }
+      processCharReception(CharSerialRX, &usbReceivedData);
     }
     else
     {
